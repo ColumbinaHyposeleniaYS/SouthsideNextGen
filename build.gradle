@@ -1,0 +1,55 @@
+plugins {
+    id 'fabric-loom' version '1.13.6'
+}
+
+version = '2.0.1'
+
+repositories {
+    maven { url = 'https://maven.aliyun.com/repository/public' }
+    maven { url = 'https://maven.aliyun.com/repository/central' }
+    mavenCentral()
+    maven { url = 'https://maven.fabricmc.net/' }
+}
+
+loom {
+    accessWidenerPath = file('src/main/resources/southside.accesswidener')
+    mixin {
+        useLegacyMixinAp = true
+        defaultRefmapName = 'southside-refmap.json'
+    }
+}
+
+dependencies {
+    minecraft 'com.mojang:minecraft:1.21.4'
+    mappings files('mappings/yarn-1.21.4+build.8-v2.jar')
+    modImplementation 'net.fabricmc:fabric-loader:0.18.1'
+    modImplementation 'net.fabricmc.fabric-api:fabric-api:0.119.2+1.21.4'
+    compileOnly 'io.github.llamalad7:mixinextras-fabric:0.5.0'
+    compileOnly 'org.projectlombok:lombok:1.18.42'
+    compileOnly 'org.jetbrains:annotations:26.0.2'
+    compileOnly 'net.java.dev.jna:jna-platform:5.15.0'
+    compileOnly 'org.apache.httpcomponents:httpclient:4.5.14'
+    compileOnly 'org.lwjgl:lwjgl-nanovg:3.3.3'
+    implementation fileTree('src/main/resources/META-INF/jars') { include '*.jar' }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 21
+    options.encoding = 'UTF-8'
+    options.compilerArgs.addAll(['-Xmaxerrs', '2000'])
+}
+
+tasks.named('jar') {
+    manifest.from('src/main/resources/META-INF/MANIFEST.MF')
+    exclude('META-INF/MANIFEST.MF')
+    archiveClassifier = 'dev'
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+}
+
+tasks.named('remapJar') {
+    archiveClassifier = 'rebuilt'
+    destinationDirectory = layout.buildDirectory.dir('libs')
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+}
