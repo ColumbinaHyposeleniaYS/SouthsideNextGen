@@ -8,15 +8,18 @@ import dev.southside.event.events.PlayerUpdateEvent;
 import dev.southside.module.Category;
 import dev.southside.module.Module;
 import dev.southside.orbit.EventHandler;
+import dev.southside.utils.network.PacketUtils;
 import dev.southside.utils.player.EnchantmentUtils;
 import dev.southside.utils.player.MovementUtils;
 import net.minecraft.screen.ScreenHandler;
 import net.minecraft.item.ItemStack;
 import net.minecraft.enchantment.Enchantments;
 import net.minecraft.network.packet.c2s.play.UpdateSelectedSlotC2SPacket;
+import net.minecraft.network.packet.c2s.play.ClientCommandC2SPacket;
+import net.minecraft.network.packet.c2s.play.ClientCommandC2SPacket.Mode;
 
 public class Criticals extends Module {
-   public static final Dropdown mode = new Dropdown("Mode", "Switch", "Switch", "Stuck", "Packet");
+   public static final Dropdown mode = new Dropdown("Mode", "Switch", "Switch", "Stuck", "Packet", "StopSprint");
    private int lastSlot;
    private int attacks;
    private boolean release;
@@ -28,6 +31,14 @@ public class Criticals extends Module {
 
    @EventHandler
    public void onAttack(AttackEvent event) {
+      if (mode.isMode("StopSprint") && event.stage == Stage.PRE) {
+         PacketUtils.sendPacket(new ClientCommandC2SPacket(mc.player, Mode.STOP_SPRINTING));
+      }
+
+      if (mode.isMode("StopSprint") && event.stage == Stage.POST) {
+         PacketUtils.sendPacket(new ClientCommandC2SPacket(mc.player, Mode.START_SPRINTING));
+      }
+
       if (mode.isMode("Stuck") && event.stage == Stage.PRE) {
          this.attacks++;
          if (this.attacks % 2 == 0) {
