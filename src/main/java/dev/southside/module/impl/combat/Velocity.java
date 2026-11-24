@@ -43,9 +43,6 @@ import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.network.packet.Packet;
 import net.minecraft.network.packet.s2c.play.PlayerPositionLookS2CPacket;
-import net.minecraft.network.packet.s2c.play.EntityDamageS2CPacket;
-import net.minecraft.entity.LivingEntity;
-import net.minecraft.entity.decoration.ArmorStandEntity;
 import net.minecraft.network.packet.s2c.play.EntityVelocityUpdateS2CPacket;
 import net.minecraft.network.packet.s2c.play.EntityS2CPacket;
 import net.minecraft.network.packet.s2c.play.EntityPositionSyncS2CPacket;
@@ -64,13 +61,9 @@ public class Velocity extends Module {
    public final Slider targetMotion = new Slider("Target Motion", 0.15, 0.05, 0.5, 0.05);
    public final Switch multiTargetFix = new Switch("Multi Target", true);
    public final Slider releaseDistance = new Slider("Release Distance", 1.6, 0.1, 3.0, 0.1);
-   public final Slider attackCount = new Slider("Attack Count", 3, 0, 20, 1);
-   public final Slider lagTargetRangeStart = new Slider("Lag Target Range Start", 2.0, 0.0, 20.0, 0.5);
-   public final Slider lagTargetRangeEnd = new Slider("Lag Target Range End", 6.0, 1.0, 20.0, 0.5);
-   public final Slider lagMaxDelay = new Slider("Lag Max Delay", 10, 1, 1000, 1);
-   public final Switch lagRequireKillAura = new Switch("Lag Require KillAura", false);
-   public final Slider horizontal = new Slider("Horizontal", 0.6, 0.0, 1.0, 0.05);
-   public final Slider vertical = new Slider("Vertical", 1.0, 0.0, 1.0, 0.05);
+   public final Slider counts = new Slider("Attack Counts", 3, 1, 5, 1);
+   public final Slider sprintTicks = new Slider("Sprint Ticks", 3, 1, 5, 1);
+   public final Slider maxDelay = new Slider("Max Delay", 1000, 0, 1000, 50);
    public static boolean gotKB;
    public boolean jump;
    int coolDownTicks;
@@ -81,14 +74,14 @@ public class Velocity extends Module {
       private int aimSkipTicks;
    private ProgressBarOverlay.ProgressHandle progressHandle;
 
-   // ==== Reduce 模式状态（LiquidX 风格：受击+速度判定→冲刺攻击×(horizontal,vertical)减速，lag 队列放包） ====
+   // ==== Reduce 模式状态（Starain 风格纯延迟放包） ====
+   public static int attackQueue;
+   public static int sprintQueue;
+   public static boolean delay;
+   private static float yaw;
    private final Queue<Packet<?>> packets = new ConcurrentLinkedQueue<>();
-   private Entity reduceTarget;
-   private int remainingAttackCount;
-   private boolean receiveDamage;
-   private int lagTicks = -1;
-   private long currentGameTick;
-   private long forwardInputAttackGameTick = -1L;
+   private long lag;
+   private long startDelay;
 
    public Velocity() {
       super(Category.Combat, "Velocity", "Reduce KnockBack");
@@ -106,13 +99,10 @@ public class Velocity extends Module {
       this.addModeVisibility(targetMotion, false);
       this.addModeVisibility(multiTargetFix, false);
       this.addModeVisibility(releaseDistance, false);
-      this.addModeVisibility(attackCount, true);
-      this.addModeVisibility(lagTargetRangeStart, true);
-      this.addModeVisibility(lagTargetRangeEnd, true);
-      this.addModeVisibility(lagMaxDelay, true);
-      this.addModeVisibility(lagRequireKillAura, true);
-      this.addModeVisibility(horizontal, true);
-      this.addModeVisibility(vertical, true);
+      this.addModeVisibility(debugHud, true);
+      this.addModeVisibility(counts, true);
+      this.addModeVisibility(sprintTicks, true);
+      this.addModeVisibility(maxDelay, true);
    }
 
    /** reduce=true: 仅 Reduce 模式显示; false: 仅 Desync 模式显示 */
@@ -166,13 +156,14 @@ public class Velocity extends Module {
    }
 
    private void resetReduce() {
-      this.reduceTarget = null;
-      this.remainingAttackCount = 0;
-      this.receiveDamage = false;
-      this.lagTicks = -1;
-      this.currentGameTick = 0L;
-      this.forwardInputAttackGameTick = -1L;
+      delay = false;
+      attackQueue = 0;
+      sprintQueue = 0;
+      this.jump = false;
+      yaw = 0.0F;
       this.packets.clear();
+      this.lag = 0L;
+      this.startDelay = 0L;
       if (ClientUtils.nullCheck() || mc.player != null) {
          this.setSuffix("");
       }
@@ -182,6 +173,10 @@ public class Velocity extends Module {
       return mode.isMode("Reduce");
    }
 
+   private static float yawFromMotion(double motionX, double motionZ) {
+      float y = (float) (Math.toDegrees(Math.atan2(motionZ, motionX)) + 90.0);
+      return MathHelper.wrapDegrees(y);
+   }
 
    @EventHandler
    public void onPacket(PacketEvent event) {
@@ -218,65 +213,51 @@ public class Velocity extends Module {
       }
    }
 
-   // ==== Reduce 模式：收包（LiquidX 逻辑：受击→速度包→lag 或进入攻击计数） ====
+   // ==== Reduce 模式：收包（照搬 Starain 逻辑，改为 Southside Yarn 映射） ====
    private void onPacketReduce(PacketEvent event, Packet<?> packet) {
       try {
-         // lag 期间拦截移动/速度相关包并自行入队，位置包视为服务器 FLAG 信号
+         if (this.coolDownTicks > 0) {
+            return;
+         }
+
+         // delay 阶段拦截移动/速度相关包并自行入队
          if (packet instanceof EntityVelocityUpdateS2CPacket
             || packet instanceof EntityPositionSyncS2CPacket
             || packet instanceof EntityS2CPacket
             || packet instanceof CommonPingS2CPacket
             || packet instanceof PlayerPositionLookS2CPacket) {
-            if (this.lagTicks >= 0) {
-               if (packet instanceof PlayerPositionLookS2CPacket) {
-                  this.releaseReason = ReleaseReason.FLAG;
-               }
+            if (delay) {
                event.setCancelled(true);
                this.packets.add(packet);
             }
-            return;
          }
 
-         if (!(packet instanceof EntityDamageS2CPacket damagePacket
-            || packet instanceof EntityVelocityUpdateS2CPacket velocityPacket)) {
-            return;
+         // 服务器活跃度检测：位置/爆炸包刷新 lag 时间戳
+         if (packet instanceof PlayerPositionLookS2CPacket) {
+            this.lag = System.currentTimeMillis();
          }
 
-         // 受击判定：damage 包标记 receiveDamage，速度包确认（LiquidX isLocalPlayerDamage/isLocalPlayerVelocity）
-         if (packet instanceof EntityDamageS2CPacket dp && dp.entityId() == mc.player.getId()) {
-            this.receiveDamage = true;
-         } else if (packet instanceof EntityVelocityUpdateS2CPacket vp
-            && vp.getEntityId() == mc.player.getId()
-            && this.receiveDamage) {
-            this.receiveDamage = false;
-            if (mc.player.isUsingItem() || Southside.INSTANCE.getModuleManager().isEnabled(dev.southside.module.impl.world.Scaffold.class)) {
-               return;
-            }
-
-            this.findReduceTarget();
-
-            boolean canLag = !this.lagRequireKillAura.getValue()
-               || Southside.INSTANCE.getModuleManager().isEnabled(KillAura.class);
-            if ((this.reduceTarget == null && canLag)
-               || (this.reduceTarget != null && !mc.player.isSprinting())) {
-               this.lagTicks = this.lagMaxDelay.getValue().intValue();
-            } else if (this.reduceTarget != null) {
-               this.remainingAttackCount = (int) this.attackCount.getValue().doubleValue();
+         if (packet instanceof EntityVelocityUpdateS2CPacket velocityPacket
+            && velocityPacket.getEntityId() == mc.player.getId()) {
+            long now = System.currentTimeMillis();
+            if (now - this.lag >= 100L) {
+               boolean checkFall = velocityPacket.getVelocityY() > 0.0
+                  && (velocityPacket.getVelocityX() != 0.0 || velocityPacket.getVelocityZ() != 0.0);
+               if (checkFall && !delay) {
+                  delay = true;
+                  event.setCancelled(true);
+                  this.packets.add(packet);
+                  this.startDelay = now;
+                  gotKB = true;
+                  this.kbPacket = velocityPacket;
+                  this.motion = new Vec3d(velocityPacket.getVelocityX(), velocityPacket.getVelocityY(), velocityPacket.getVelocityZ());
+               }
+               yaw = yawFromMotion(velocityPacket.getVelocityX(), velocityPacket.getVelocityZ());
             }
          }
       } catch (Exception ignored) {
       }
    }
-
-   private enum ReleaseReason {
-      TARGET_REACHED,
-      FLAG,
-      SPECTATOR,
-      OUT_OF_RANGE,
-      MAX_DELAY
-   }
-
-   private ReleaseReason releaseReason = null;
 
    private boolean shouldReduce(EntityVelocityUpdateS2CPacket packet) {
       return Southside.INSTANCE.getModuleManager().isEnabled(KillAura.class)
@@ -291,108 +272,21 @@ public class Velocity extends Module {
       }
 
       try {
-         this.currentGameTick++;
-
-         // LiquidX GameTick：攻击计数期间逐 tick 冲刺攻击 + 速度衰减
-         if (this.remainingAttackCount > 0) {
-            if (this.hasLostReduceTarget()) {
-               this.remainingAttackCount = 0;
-               this.reduceTarget = null;
-               return;
-            }
-
-            mc.player.setSprinting(false);
-            mc.interactionManager.attackEntity(mc.player, this.reduceTarget);
-            mc.player.swingHand(Hand.MAIN_HAND);
-            this.forwardInputAttackGameTick = this.currentGameTick;
-            mc.player.setVelocity(mc.player.getVelocity().multiply(
-               this.horizontal.getValue().doubleValue(),
-               this.vertical.getValue().doubleValue(),
-               this.horizontal.getValue().doubleValue()
-            ));
-            this.remainingAttackCount--;
-            if (this.remainingAttackCount == 0) {
-               this.reduceTarget = null;
+         if (delay && (mc.player.isOnGround()
+            || System.currentTimeMillis() - this.lag < 100L
+            || System.currentTimeMillis() - this.startDelay >= this.maxDelay.getValue().intValue())) {
+            this.flush();
+            if (System.currentTimeMillis() - this.lag >= 100L) {
+               attackQueue = this.counts.getValue().intValue();
+               sprintQueue = this.sprintTicks.getValue().intValue();
             }
          }
 
-         // LiquidX TickPacketProcess：releaseReason 到达时放包
-         if (this.releaseReason != null && this.lagTicks >= 0) {
-            this.flush();
-            this.lagTicks = -1;
-            if (this.releaseReason == ReleaseReason.TARGET_REACHED) {
-               this.remainingAttackCount = (int) this.attackCount.getValue().doubleValue();
-            }
-            this.releaseReason = null;
+         if (sprintQueue >= 1 && (KillAura.targets == null || KillAura.targets.isEmpty())) {
+            RotationUtils.setRotation(new Rotation(yaw, RotationUtils.getRotationSafely().pitch), 180);
          }
       } catch (Exception ignored) {
       }
-   }
-
-   private Entity findTarget() {
-      return KillAura.target != null && Southside.INSTANCE.getModuleManager().get(KillAura.class).inRaycast(KillAura.target) ? KillAura.target : null;
-   }
-
-   private boolean hasLostReduceTarget() {
-      if (this.reduceTarget == null || this.reduceTarget.isRemoved()) {
-         return true;
-      }
-
-      if (!Southside.INSTANCE.getModuleManager().isEnabled(KillAura.class)) {
-         return false;
-      }
-
-      Entity auraTarget = KillAura.target;
-      return auraTarget == null || auraTarget.getId() != this.reduceTarget.getId();
-   }
-
-   private void findReduceTarget() {
-      boolean canLag = !this.lagRequireKillAura.getValue()
-         || Southside.INSTANCE.getModuleManager().isEnabled(KillAura.class);
-      Entity auraTarget = KillAura.target;
-      if (auraTarget != null
-         && Southside.INSTANCE.getModuleManager().isEnabled(KillAura.class)
-         && !auraTarget.isRemoved()
-         && auraTarget.isAlive()
-         && auraTarget.squaredDistanceTo(mc.player) <= this.lagTargetRangeStart.getValue().doubleValue() * this.lagTargetRangeStart.getValue().doubleValue()) {
-         this.reduceTarget = auraTarget;
-         return;
-      }
-
-      this.reduceTarget = null;
-      if (!canLag) {
-         return;
-      }
-
-      if (mc.crosshairTarget instanceof EntityHitResult hit
-         && hit.getEntity() instanceof LivingEntity living
-         && !living.isRemoved()
-         && living.isAlive()
-         && !(living instanceof ArmorStandEntity)
-         && living.squaredDistanceTo(mc.player) <= this.lagTargetRangeStart.getValue().doubleValue() * this.lagTargetRangeStart.getValue().doubleValue()) {
-         this.reduceTarget = living;
-         return;
-      }
-
-      // lag 期间回退：End 范围内最近的可攻击实体（LiquidX weightedMinByOrNullAtMost 简化版）
-      double endSq = this.lagTargetRangeEnd.getValue().doubleValue() * this.lagTargetRangeEnd.getValue().doubleValue();
-      Entity nearest = null;
-      double nearestDist = Double.MAX_VALUE;
-      for (Entity entity : mc.world.getEntities()) {
-         if (entity instanceof LivingEntity living2
-            && !living2.isRemoved()
-            && living2.isAlive()
-            && !(living2 instanceof ArmorStandEntity)
-            && living2 != mc.player
-            && !dev.southside.module.impl.misc.AntiBot.isBot(living2)) {
-            double d = living2.squaredDistanceTo(mc.player);
-            if (d <= endSq && d < nearestDist) {
-               nearestDist = d;
-               nearest = living2;
-            }
-         }
-      }
-      this.reduceTarget = nearest;
    }
 
    @EventHandler(
@@ -400,9 +294,9 @@ public class Velocity extends Module {
    )
    public void onRotation(RotationEvent event) {
       if (this.isReduceMode()) {
-         if (this.debugHud.getValue() && this.lagTicks >= 0) {
-            this.setSuffix(this.lagTicks + "t");
-         } else if (this.lagTicks < 0) {
+         if (this.debugHud.getValue() && delay) {
+            this.setSuffix(System.currentTimeMillis() - this.startDelay + "ms");
+         } else if (!delay) {
             this.setSuffix("");
          }
          return;
@@ -531,6 +425,22 @@ public class Velocity extends Module {
       }
    }
 
+   // ==== Reduce 模式：攻击队列处理（PlayerTick 风格，借用 RotationAppliedEvent tick 时机） ====
+   private void handleAttackQueue() {
+      if (attackQueue >= 1) {
+         if (mc.crosshairTarget instanceof EntityHitResult entityHitResult
+            && entityHitResult.getEntity() instanceof PlayerEntity pl
+            && !dev.southside.module.impl.misc.AntiBot.isBot(pl)) {
+            mc.interactionManager.attackEntity(mc.player, pl);
+            mc.player.swingHand(Hand.MAIN_HAND);
+         }
+         attackQueue--;
+      }
+   }
+
+   private Entity findTarget() {
+      return KillAura.target != null && Southside.INSTANCE.getModuleManager().get(KillAura.class).inRaycast(KillAura.target) ? KillAura.target : null;
+   }
 
       private boolean serverAimValid(Entity entity) {
       if (entity == null) {
@@ -681,59 +591,53 @@ public class Velocity extends Module {
       }
    }
 
-   // ==== Reduce 模式：移动输入（LiquidX MovementInput：lag 递减 + 放包原因判定） ====
+   // ==== Reduce 模式：移动输入（照搬 Starain onMoveInput） ====
    private void onMoveReduce(MovementInputEvent event) {
       if (mc.player == null) {
          return;
       }
 
-      if (this.lagTicks > 0 && this.releaseReason == null) {
-         this.lagTicks--;
-         this.findTarget();
+      long sinceLag = System.currentTimeMillis() - this.lag;
 
-         if (mc.player.getAbilities().flying) {
-            this.releaseReason = ReleaseReason.SPECTATOR;
-         } else if (this.reduceTarget != null) {
+      if (delay && mc.player.fallDistance == 0.0F
+         && mc.crosshairTarget instanceof EntityHitResult entityHitResult
+         && entityHitResult.getEntity() instanceof PlayerEntity pl
+         && !dev.southside.module.impl.misc.AntiBot.isBot(pl)) {
+         if (sinceLag >= 100L) {
             event.setForward(true);
             event.setRight(false);
             event.setLeft(false);
             event.setBack(false);
             event.setSprint(true);
-            this.releaseReason = ReleaseReason.TARGET_REACHED;
-         } else if (this.reduceTarget == null && this.noTargetInRange()) {
-            this.releaseReason = ReleaseReason.OUT_OF_RANGE;
-         } else if (this.lagTicks == 0) {
-            this.releaseReason = ReleaseReason.MAX_DELAY;
          }
       }
 
-      if (this.currentGameTick == this.forwardInputAttackGameTick) {
+      if (this.jump && mc.player.isOnGround()) {
+         if (sinceLag >= 100L) {
+            event.setJump(true);
+            event.setForward(true);
+            event.setRight(false);
+            event.setLeft(false);
+            event.setBack(false);
+         }
+         this.jump = false;
+      }
+
+      if (sprintQueue-- >= 1
+         && (KillAura.targets == null || KillAura.targets.isEmpty())
+         && sinceLag >= 100L) {
          event.setForward(true);
+         event.setRight(false);
+         event.setLeft(false);
          event.setBack(false);
+         event.setSprint(true);
       }
-   }
-
-   // lag 中且 End 范围内无任何实体 → 超范围放包
-   private boolean noTargetInRange() {
-      double endSq = this.lagTargetRangeEnd.getValue().doubleValue() * this.lagTargetRangeEnd.getValue().doubleValue();
-      for (Entity entity : mc.world.getEntities()) {
-         if (entity instanceof LivingEntity living
-            && !living.isRemoved()
-            && living.isAlive()
-            && !(living instanceof ArmorStandEntity)
-            && living != mc.player
-            && !dev.southside.module.impl.misc.AntiBot.isBot(living)
-            && living.squaredDistanceTo(mc.player) <= endSq) {
-            return false;
-         }
-      }
-      return true;
    }
 
    // ==== Reduce 模式：放包 ====
    private void flush() {
       try {
-         if (this.lagTicks < 0) {
+         if (!delay) {
             return;
          }
 
@@ -743,6 +647,9 @@ public class Velocity extends Module {
                PacketUtils.handlePacket(packet);
             }
          }
+
+         delay = false;
+         this.jump = true;
       } catch (Exception ignored) {
       }
    }
