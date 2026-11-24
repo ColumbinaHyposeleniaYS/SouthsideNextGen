@@ -90,6 +90,28 @@ public class Velocity extends Module {
    @Override
    public void initPostRunnable() {
       super.initPostRunnable();
+      // 按模式隐藏选项：Desync 专属设置只在 Desync 模式显示，Reduce 专属只在 Reduce 模式显示
+      this.addModeVisibility(debug, false);
+      this.addModeVisibility(fireballCooldown, false);
+      this.addModeVisibility(modernCombat, false);
+      this.addModeVisibility(testFull, false);
+      this.addModeVisibility(delayTillGround, false);
+      this.addModeVisibility(targetMotion, false);
+      this.addModeVisibility(multiTargetFix, false);
+      this.addModeVisibility(releaseDistance, false);
+      this.addModeVisibility(debugHud, true);
+      this.addModeVisibility(counts, true);
+      this.addModeVisibility(sprintTicks, true);
+      this.addModeVisibility(maxDelay, true);
+   }
+
+   /** reduce=true: 仅 Reduce 模式显示; false: 仅 Desync 模式显示 */
+   private void addModeVisibility(cc.polyfrost.oneconfig.config.options.Option<?> option, boolean reduce) {
+      if (option.basicOption == null) {
+         return;
+      }
+
+      option.basicOption.addHideCondition(() -> reduce ? !this.isReduceMode() : this.isReduceMode());
    }
 
    @Override
